@@ -1,300 +1,282 @@
-// Tractor physics with torque curves, wheel slip, weather effects
-// Based on empirical data from real tractor pulls + arcade tuning
+import SimplePeer from 'simple-peer';
+import type { Instance } from 'simple-peer';
+import type { PlayerState } from '@tractor-royale/shared';
 
-export interface TractorPhysicsConfig {
-  mass: number; // kg
-  engine: {
-    maxTorque: number; // Nm at peak RPM
-    redline: number; // max RPM
-    torqueCurve: [number, number][]; // [RPM, torque%] pairs
-  };
-  drivetrain: {
-    gearRatios: number[];
-    finalDrive: number;
-    transmission: 'auto' | 'manual';
-  };
-  tires: {
-    radius: number; // meters
-    width: number; // meters
-    grip: number; // coefficient (0-1, modified by weather)
-  };
-  aero: {
-    dragCoefficient: number;
-    frontalArea: number; // m²
-  };
+export interface GameStateSnapshot {
+  tick: number;
+  timestamp: number;
+  players: Map<string, PlayerState>;
 }
 
-export interface WeatherCondition {
-  type: 'clear' | 'rain' | 'mud';
-  gripModifier: number; // multiplier for tire grip
-  visibilityModifier: number;
-}
+type MessageType = 
+  | { type: 'state'; data: GameStateSnapshot }
+  | { type: 'input'; playerId: string; throttle: number; sequence: number; timestamp: number }
+  | { type: 'join'; playerId: string; tractorConfig: any }
+  | { type: 'chat'; playerId: string; message: string };
 
-export class TractorPhysics {
-  private config: TractorPhysicsConfig;
-  private state = {
-    position: 0, // meters from start
-    velocity: 0, // m/s
-    rpm: 800, // idle RPM
-    throttle: 0, // 0-1
-    wheelSlip: 0, // 0-1 (1 = full spin)
-    currentGear: 1,
-  };
+export class WebRTCManager {
+  private localPlayerId: string;
+  private isHost: boolean;
+  private peers: Map<string, Instance> = new Map();
+  private signalingServer: string;
   
-  private weather: WeatherCondition = {
-    type: 'clear',
-    gripModifier: 1.0,
-    visibilityModifier: 1.0,
-  };
+  private inputHistory: Array<{ sequence: number; throttle: number; timestamp: number }> = [];
+  private lastServerTick = 0;
+  private localSequence = 0;
+  
+  private onStateUpdate?: (snapshot: GameStateSnapshot) => void;
+  private onPlayerJoin?: (playerId: string) => void;
+  private onPlayerLeave?: (playerId: string) => void;
+  private onChatMessage?: (playerId: string, message: string) => void;
 
-  constructor(config: TractorPhysicsConfig) {
-    this.config = config;
+  constructor(config: {
+    localPlayerId: string;
+    isHost: boolean;
+    signalingServer: string;
+  }) {
+    this.localPlayerId = config.localPlayerId;
+    this.isHost = config.isHost;
+    this.signalingServer = config.signalingServer;
   }
 
-  // Main physics step - call at 60Hz minimum
-  update(deltaTime: number, inputThrottle: number): void {
-    this.state.throttle = Math.max(0, Math.min(1, inputThrottle));
+  async connectToRoom(roomId: string): Promise<void> {
+    const ws = new WebSocket(`${this.signalingServer}?room=${roomId}&player=${this.localPlayerId}`);
     
-    // Auto transmission logic
-    if (this.config.drivetrain.transmission === 'auto') {
-      this.updateAutoTransmission();
-    }
-    
-    // Calculate engine output
-    const engineTorque = this.calculateEngineTorque();
-    const wheelTorque = this.calculateWheelTorque(engineTorque);
-    
-    // Calculate tire forces with slip
-    const { tractionForce, slipRatio } = this.calculateTireForces(wheelTorque);
-    this.state.wheelSlip = slipRatio;
-    
-    // External forces
-    const dragForce = this.calculateDrag();
-    const rollingResistance = this.calculateRollingResistance();
-    
-    // Net force and acceleration
-    const netForce = tractionForce - dragForce - rollingResistance;
-    const acceleration = netForce / this.config.mass;
-    
-    // Integrate velocity and position (Euler method, sufficient for this)
-    this.state.velocity += acceleration * deltaTime;
-    this.state.velocity = Math.max(0, this.state.velocity); // No reverse
-    this.state.position += this.state.velocity * deltaTime;
-    
-    // Update RPM based on wheel speed
-    this.updateRPM();
-  }
-
-  private calculateEngineTorque(): number {
-    // Interpolate torque curve based on current RPM
-    const curve = this.config.engine.torqueCurve;
-    const rpm = this.state.rpm;
-    
-    // Find surrounding points on curve
-    let lowerPoint = curve[0];
-    let upperPoint = curve[curve.length - 1];
-    
-    for (let i = 0; i < curve.length - 1; i++) {
-      if (rpm >= curve[i][0] && rpm <= curve[i + 1][0]) {
-        lowerPoint = curve[i];
-        upperPoint = curve[i + 1];
-        break;
+    ws.onmessage = async (event) => {
+      const message = JSON.parse(event.data);
+      
+      if (message.type === 'peer-list') {
+        for (const peerId of message.peers) {
+          if (peerId !== this.localPlayerId) {
+            await this.connectToPeer(peerId, true);
+          }
+        }
       }
-    }
+      
+      if (message.type === 'signal') {
+        const { from, signal } = message;
+        
+        if (!this.peers.has(from)) {
+          await this.connectToPeer(from, false);
+        }
+        
+        this.peers.get(from)?.signal(signal);
+      }
+      
+      if (message.type === 'player-left') {
+        this.handlePlayerLeave(message.playerId);
+      }
+    };
     
-    // Linear interpolation
-    const t = (rpm - lowerPoint[0]) / (upperPoint[0] - lowerPoint[0]);
-    const torquePercent = lowerPoint[1] + t * (upperPoint[1] - lowerPoint[1]);
-    
-    // Apply throttle and return absolute torque
-    return this.config.engine.maxTorque * torquePercent * this.state.throttle;
-  }
-
-  private calculateWheelTorque(engineTorque: number): number {
-    const gearRatio = this.config.drivetrain.gearRatios[this.state.currentGear - 1];
-    const finalDrive = this.config.drivetrain.finalDrive;
-    return engineTorque * gearRatio * finalDrive;
-  }
-
-  private calculateTireForces(wheelTorque: number): {
-    tractionForce: number;
-    slipRatio: number;
-  } {
-    // Maximum traction force based on weight and grip
-    const normalForce = this.config.mass * 9.81; // Weight force
-    const baseGrip = this.config.tires.grip * this.weather.gripModifier;
-    const maxTraction = normalForce * baseGrip;
-    
-    // Theoretical force from wheel torque
-    const wheelRadius = this.config.tires.radius;
-    const theoreticalForce = wheelTorque / wheelRadius;
-    
-    // Calculate slip ratio (Pacejka tire model simplified)
-    const wheelSpeed = this.state.velocity; // Linear speed
-    const theoreticalWheelSpeed = (wheelTorque / wheelRadius) / this.config.mass;
-    
-    let slipRatio = 0;
-    if (wheelSpeed > 0.1) {
-      slipRatio = Math.abs(theoreticalWheelSpeed - wheelSpeed) / wheelSpeed;
-    } else {
-      // Static friction at launch
-      slipRatio = theoreticalForce / maxTraction;
-    }
-    
-    slipRatio = Math.min(1, slipRatio);
-    
-    // Traction force with slip curve (peaks at ~10% slip, then drops)
-    const peakSlip = 0.1;
-    let tractionMultiplier: number;
-    
-    if (slipRatio < peakSlip) {
-      tractionMultiplier = slipRatio / peakSlip;
-    } else {
-      // Exponential falloff after peak
-      tractionMultiplier = Math.exp(-(slipRatio - peakSlip) * 3);
-    }
-    
-    const actualTraction = Math.min(theoreticalForce, maxTraction * tractionMultiplier);
-    
-    return {
-      tractionForce: actualTraction,
-      slipRatio: slipRatio,
+    ws.onerror = (error) => {
+      console.error('Signaling WebSocket error:', error);
     };
   }
 
-  private calculateDrag(): number {
-    // Aerodynamic drag: F = 0.5 * ρ * v² * Cd * A
-    const airDensity = 1.225; // kg/m³ at sea level
-    const velocity = this.state.velocity;
-    return 0.5 * airDensity * velocity * velocity * 
-           this.config.aero.dragCoefficient * this.config.aero.frontalArea;
+  private async connectToPeer(peerId: string, initiator: boolean): Promise<void> {
+    const peer = new SimplePeer({
+      initiator,
+      trickle: true,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+      },
+    });
+
+    this.peers.set(peerId, peer);
+
+    peer.on('signal', (signal) => {
+      this.sendSignal(peerId, signal);
+    });
+
+    peer.on('connect', () => {
+      console.log(`Connected to peer: ${peerId}`);
+      this.onPlayerJoin?.(peerId);
+    });
+
+    peer.on('data', (data) => {
+      const message = JSON.parse(data.toString()) as MessageType;
+      this.handleMessage(peerId, message);
+    });
+
+    peer.on('error', (err) => {
+      console.error(`Peer ${peerId} error:`, err);
+    });
+
+    peer.on('close', () => {
+      this.handlePlayerLeave(peerId);
+    });
   }
 
-  private calculateRollingResistance(): number {
-    // Rolling resistance: F = Crr * N
-    const rollingCoefficient = 0.015; // Typical for tractor tires on dirt
-    const normalForce = this.config.mass * 9.81;
-    return rollingCoefficient * normalForce;
-  }
-
-  private updateRPM(): void {
-    // Calculate RPM from wheel speed
-    const wheelAngularVelocity = this.state.velocity / this.config.tires.radius;
-    const gearRatio = this.config.drivetrain.gearRatios[this.state.currentGear - 1];
-    const finalDrive = this.config.drivetrain.finalDrive;
+  sendInput(throttle: number): void {
+    this.localSequence++;
+    const input = {
+      throttle,
+      sequence: this.localSequence,
+      timestamp: performance.now(),
+    };
     
-    this.state.rpm = (wheelAngularVelocity * gearRatio * finalDrive * 60) / (2 * Math.PI);
-    this.state.rpm = Math.max(800, Math.min(this.config.engine.redline, this.state.rpm));
+    this.inputHistory.push(input);
+    
+    if (this.inputHistory.length > 60) {
+      this.inputHistory.shift();
+    }
+    
+    const message: MessageType = {
+      type: 'input',
+      playerId: this.localPlayerId,
+      throttle: input.throttle,
+      sequence: input.sequence,
+      timestamp: input.timestamp,
+    };
+    
+    this.broadcast(message);
   }
 
-  private updateAutoTransmission(): void {
-    const gearCount = this.config.drivetrain.gearRatios.length;
-    const upshiftRPM = this.config.engine.redline * 0.85;
-    const downshiftRPM = this.config.engine.redline * 0.4;
+  processInputsAndBroadcastState(
+    localPhysics: Map<string, any>,
+    inputs: Map<string, { throttle: number; sequence: number }>
+  ): void {
+    if (!this.isHost) return;
     
-    if (this.state.rpm > upshiftRPM && this.state.currentGear < gearCount) {
-      this.state.currentGear++;
-    } else if (this.state.rpm < downshiftRPM && this.state.currentGear > 1) {
-      this.state.currentGear--;
+    for (const [playerId, input] of inputs) {
+      const physics = localPhysics.get(playerId);
+      if (physics) {
+        physics.update(1 / 60, input.throttle);
+      }
+    }
+    
+    const snapshot: GameStateSnapshot = {
+      tick: ++this.lastServerTick,
+      timestamp: performance.now(),
+      players: new Map(),
+    };
+    
+    for (const [playerId, physics] of localPhysics) {
+      snapshot.players.set(playerId, {
+        playerId,
+        username: `Player ${playerId.slice(0, 4)}`,
+        position: physics.getPosition(),
+        velocity: physics.getVelocity(),
+        throttle: inputs.get(playerId)?.throttle || 0,
+        timestamp: snapshot.timestamp,
+        inputSequence: inputs.get(playerId)?.sequence || 0,
+        tractorConfig: {
+          bodyId: 'body_rust_bucket',
+          cabId: 'cab_classic',
+          wheelsId: 'wheels_tractor_standard',
+          paintColor: '#8B4513',
+          paintMetalness: 0.3,
+          paintRoughness: 0.7,
+        },
+        powerUps: [],
+        finished: false,
+      });
+    }
+    
+    const message: MessageType = {
+      type: 'state',
+      data: snapshot,
+    };
+    
+    this.broadcast(message);
+  }
+
+  reconcileState(serverSnapshot: GameStateSnapshot, localPhysics: any): void {
+    const serverState = serverSnapshot.players.get(this.localPlayerId);
+    if (!serverState) return;
+    
+    const firstUnacked = this.inputHistory.findIndex(
+      input => input.sequence > serverState.inputSequence
+    );
+    
+    if (firstUnacked === -1) {
+      localPhysics.deserialize(JSON.stringify({
+        position: serverState.position,
+        velocity: serverState.velocity,
+        throttle: serverState.throttle,
+      }));
+      return;
+    }
+    
+    localPhysics.deserialize(JSON.stringify({
+      position: serverState.position,
+      velocity: serverState.velocity,
+      throttle: serverState.throttle,
+    }));
+    
+    const dt = 1 / 60;
+    for (let i = firstUnacked; i < this.inputHistory.length; i++) {
+      localPhysics.update(dt, this.inputHistory[i].throttle);
+    }
+    
+    this.inputHistory = this.inputHistory.slice(firstUnacked);
+  }
+
+  private handleMessage(peerId: string, message: MessageType): void {
+    switch (message.type) {
+      case 'state':
+        if (!this.isHost) {
+          this.onStateUpdate?.(message.data);
+        }
+        break;
+        
+      case 'input':
+        if (this.isHost) {
+          // Process in main game loop
+        }
+        break;
+        
+      case 'join':
+        this.onPlayerJoin?.(message.playerId);
+        break;
+        
+      case 'chat':
+        this.onChatMessage?.(message.playerId, message.message);
+        break;
     }
   }
 
-  // Public API
-  setWeather(weather: WeatherCondition): void {
-    this.weather = weather;
+  private handlePlayerLeave(playerId: string): void {
+    this.peers.delete(playerId);
+    this.onPlayerLeave?.(playerId);
   }
 
-  getState() {
-    return { ...this.state };
+  private broadcast(message: MessageType): void {
+    const data = JSON.stringify(message);
+    for (const peer of this.peers.values()) {
+      if (peer.connected) {
+        peer.send(data);
+      }
+    }
   }
 
-  getPosition(): number {
-    return this.state.position;
+  private sendSignal(peerId: string, signal: any): void {
+    // Send through WebSocket signaling server
   }
 
-  getVelocity(): number {
-    return this.state.velocity;
+  setOnStateUpdate(callback: (snapshot: GameStateSnapshot) => void): void {
+    this.onStateUpdate = callback;
   }
 
-  getSpeedKPH(): number {
-    return this.state.velocity * 3.6;
+  setOnPlayerJoin(callback: (playerId: string) => void): void {
+    this.onPlayerJoin = callback;
   }
 
-  getRPM(): number {
-    return this.state.rpm;
+  setOnPlayerLeave(callback: (playerId: string) => void): void {
+    this.onPlayerLeave = callback;
   }
 
-  getWheelSlip(): number {
-    return this.state.wheelSlip;
+  setOnChatMessage(callback: (playerId: string, message: string) => void): void {
+    this.onChatMessage = callback;
   }
 
-  // For replays/determinism
-  serialize(): string {
-    return JSON.stringify(this.state);
-  }
-
-  deserialize(data: string): void {
-    this.state = JSON.parse(data);
+  disconnect(): void {
+    for (const peer of this.peers.values()) {
+      peer.destroy();
+    }
+    this.peers.clear();
   }
 }
-
-// Preset tractor configurations
-export const TRACTOR_PRESETS: Record<string, TractorPhysicsConfig> = {
-  'rookie-rust-bucket': {
-    mass: 2500,
-    engine: {
-      maxTorque: 800,
-      redline: 2200,
-      torqueCurve: [
-        [800, 0.6],   // idle
-        [1200, 0.85], // low-end grunt
-        [1600, 1.0],  // peak torque
-        [2000, 0.9],
-        [2200, 0.75], // redline falloff
-      ],
-    },
-    drivetrain: {
-      gearRatios: [12.0, 8.0, 5.5],
-      finalDrive: 4.0,
-      transmission: 'auto',
-    },
-    tires: {
-      radius: 0.85,
-      width: 0.45,
-      grip: 0.7,
-    },
-    aero: {
-      dragCoefficient: 0.9, // Brick-like
-      frontalArea: 6.5,
-    },
-  },
-  
-  'midnight-thunder': {
-    mass: 3200,
-    engine: {
-      maxTorque: 1800,
-      redline: 3000,
-      torqueCurve: [
-        [800, 0.5],
-        [1500, 0.95],
-        [2000, 1.0],
-        [2500, 0.98],
-        [3000, 0.85],
-      ],
-    },
-    drivetrain: {
-      gearRatios: [15.0, 10.0, 7.0, 5.0],
-      finalDrive: 3.5,
-      transmission: 'auto',
-    },
-    tires: {
-      radius: 0.95,
-      width: 0.60,
-      grip: 0.85,
-    },
-    aero: {
-      dragCoefficient: 0.75,
-      frontalArea: 7.2,
-    },
-  },
-};
