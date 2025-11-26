@@ -1,0 +1,40 @@
+{
+  "name": "Tractor Royale",
+  "short_name": "TractorRoyale",
+  "description": "The ultimate browser tractor racing game",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#87CEEB",
+  "theme_color": "#FF6B35",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["games", "entertainment"],
+  "screenshots": [
+    {
+      "src": "/screenshots/gameplay.jpg",
+      "sizes": "1280x720",
+      "type": "image/jpeg"
+    }
+  ]
+}
+```
+
+### `packages/game-client/public/robots.txt`
+```
+User-agent: *
+Allow: /
+
+Sitemap: https://tractorroyale.github.io/sitemap.xml
